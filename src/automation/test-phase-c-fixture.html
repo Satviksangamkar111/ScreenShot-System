@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Phase C Test Fixture</title>
+</head>
+<body>
+  <h1>Phase C Storage State Fixture</h1>
+  <div id="ls-value"></div>
+  <script>
+    document.getElementById('ls-value').textContent = localStorage.getItem('testKey') || '(none)';
+  </script>
+</body>
+</html>

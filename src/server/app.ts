@@ -1,0 +1,360 @@
+import { createReadStream } from 'node:fs';
+import { readFile, stat } from 'node:fs/promises';
+import http from 'node:http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  getJob,
+  getLoginRemoteControl,
+  getRemoteControl,
+  getStandaloneLoginOutcome,
+  hasSessionFor,
+  resolveManualStep,
+  startJob,
+  startStandaloneLogin,
+} from './jobs.js';
+import { log } from '../util/logger.js';
+
+/**
+ * Minimal HTTP front end.
+ *
+ * Uses only Node's built-in server: the UI is a single page that collects one
+ * or two URLs, starts a job, polls its progress, and offers the finished
+ * document for download.
+ */
+
+const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
+
+function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(payload),
+    'Cache-Control': 'no-store',
+  });
+  res.end(payload);
+}
+
+async function readBody(req: http.IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > 1_000_000) throw new Error('Request body too large');
+    chunks.push(chunk as Buffer);
+  }
+  if (chunks.length === 0) return {};
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+/** Rejects anything that is not an http(s) URL, including file: and javascript:. */
+function validUrl(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    const u = new URL(value.trim());
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Picks which live view a job's screencast/input endpoints should act on.
+ *
+ * While a job waits on sign-in, the login RemoteControl is the one showing the
+ * sign-in page. Manual mode leaves the capture's own RemoteControl registered
+ * from the attempt that just failed, so preferring it there would stream a dead
+ * page the operator cannot possibly sign in through.
+ */
+function remoteForJob(job: { id: string; status: string }) {
+  return job.status === 'awaiting-auth'
+    ? getLoginRemoteControl(job.id) ?? getRemoteControl(job.id)
+    : getRemoteControl(job.id) ?? getLoginRemoteControl(job.id);
+}
+
+export function createServer(): http.Server {
+  return http.createServer((req, res) => {
+    void handle(req, res).catch((err: unknown) => {
+      sendJson(res, 500, {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  });
+}
+
+async function handle(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const route = url.pathname;
+
+  // --- static ---------------------------------------------------------------
+  // `no-store` because the page carries its own JS: a browser holding a cached
+  // copy keeps running the previous build's logic against a restarted server,
+  // which shows up as UI that contradicts what the server is actually doing.
+  if (req.method === 'GET' && (route === '/' || route === '/index.html')) {
+    const html = await readFile(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+    });
+    res.end(html);
+    return;
+  }
+
+  // --- full-tab live view -----------------------------------------------------
+  // The same screencast the main page embeds, in a window of its own. Signing
+  // in to a real system means SSO redirects, password managers and certificate
+  // prompts, which need more room than a panel between other panels.
+  const livePageMatch = /^\/live\/(jobs|logins)\/([a-z0-9-]+)$/i.exec(route);
+  if (req.method === 'GET' && livePageMatch) {
+    const html = await readFile(path.join(PUBLIC_DIR, 'live.html'), 'utf8');
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+    });
+    res.end(html);
+    return;
+  }
+
+  // --- does this host already have a saved session? -------------------------
+  if (req.method === 'GET' && route === '/api/session') {
+    const target = validUrl(url.searchParams.get('url'));
+    if (!target) return sendJson(res, 400, { error: 'Invalid URL' });
+    return sendJson(res, 200, { hasSession: hasSessionFor(target) });
+  }
+
+  // --- interactive sign-in ----------------------------------------------------
+  // Returns immediately with an id: the operator signs in through the live
+  // view (below), which needs the id before sign-in completes, not after.
+  if (req.method === 'POST' && route === '/api/login') {
+    const body = (await readBody(req)) as { url?: string };
+    const target = validUrl(body.url);
+    if (!target) return sendJson(res, 400, { error: 'Invalid URL' });
+
+    const loginId = startStandaloneLogin(target);
+    return sendJson(res, 202, { loginId });
+  }
+
+  // --- standalone sign-in: poll for completion ---------------------------------
+  const loginStatusMatch = /^\/api\/logins\/([a-z0-9-]+)$/i.exec(route);
+  if (req.method === 'GET' && loginStatusMatch) {
+    const outcome = getStandaloneLoginOutcome(loginStatusMatch[1]!);
+    if (!outcome) return sendJson(res, 404, { error: 'Unknown login' });
+    return sendJson(res, 200, outcome);
+  }
+
+  // --- standalone sign-in: live view (Server-Sent Events) ----------------------
+  const loginScreencastMatch = /^\/api\/logins\/([a-z0-9-]+)\/screencast$/i.exec(route);
+  if (req.method === 'GET' && loginScreencastMatch) {
+    const remote = getLoginRemoteControl(loginScreencastMatch[1]!);
+    if (!remote) return sendJson(res, 404, { error: 'No live view for this sign-in.' });
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-store',
+      Connection: 'keep-alive',
+    });
+
+    const unsubscribe = remote.onFrame((jpegBase64) => {
+      res.write(`data: ${JSON.stringify({ image: jpegBase64 })}\n\n`);
+    });
+
+    req.on('close', unsubscribe);
+    return;
+  }
+
+  // --- standalone sign-in: forward a click/key/typed text into the live page ---
+  const loginInputMatch = /^\/api\/logins\/([a-z0-9-]+)\/input$/i.exec(route);
+  if (req.method === 'POST' && loginInputMatch) {
+    const remote = getLoginRemoteControl(loginInputMatch[1]!);
+    if (!remote) return sendJson(res, 404, { error: 'No live view for this sign-in.' });
+
+    const body = (await readBody(req)) as {
+      type?: string;
+      x?: number;
+      y?: number;
+      key?: string;
+      value?: string;
+    };
+
+    if (body.type === 'click' && typeof body.x === 'number' && typeof body.y === 'number') {
+      await remote.click(body.x, body.y);
+    } else if (body.type === 'key' && typeof body.key === 'string') {
+      await remote.key(body.key);
+    } else if (body.type === 'text' && typeof body.value === 'string') {
+      await remote.insertText(body.value);
+    } else {
+      return sendJson(res, 400, { error: 'Invalid input event.' });
+    }
+
+    return sendJson(res, 200, { ok: true });
+  }
+
+  // --- start a job ----------------------------------------------------------
+  if (req.method === 'POST' && route === '/api/generate') {
+    const body = (await readBody(req)) as {
+      oldUrl?: string;
+      newUrl?: string;
+      title?: string;
+      dataEntryMode?: string;
+    };
+
+    const oldUrl = validUrl(body.oldUrl);
+    const newUrl = validUrl(body.newUrl);
+
+    if (!oldUrl && !newUrl) {
+      return sendJson(res, 400, {
+        error: 'Enter at least one URL (old, new, or both).',
+      });
+    }
+
+    const dataEntryMode = body.dataEntryMode === 'manual' ? 'manual' : 'automatic';
+
+    const job = startJob({
+      ...(oldUrl ? { oldUrl } : {}),
+      ...(newUrl ? { newUrl } : {}),
+      ...(body.title ? { title: body.title } : {}),
+      dataEntryMode,
+    });
+    return sendJson(res, 202, {
+      jobId: job.id,
+      versions: job.versions,
+      dataEntryMode: job.dataEntryMode,
+    });
+  }
+
+  // --- job status -----------------------------------------------------------
+  const statusMatch = /^\/api\/jobs\/([a-z0-9-]+)$/i.exec(route);
+  if (req.method === 'GET' && statusMatch) {
+    const job = getJob(statusMatch[1]!);
+    if (!job) return sendJson(res, 404, { error: 'Unknown job' });
+
+    return sendJson(res, 200, {
+      id: job.id,
+      status: job.status,
+      title: job.title,
+      versions: job.versions,
+      log: job.log.slice(-200),
+      error: job.error ?? null,
+      authStage: job.authStage ?? null,
+      needsLoginFor: job.needsLoginFor ?? [],
+      summary: job.summary ?? [],
+      documentName: job.documentName ?? null,
+      hasDocument: !!job.documentPath,
+      dataEntryMode: job.dataEntryMode,
+      manualQueue: job.manualQueue,
+      activeManualId: job.activeManualId ?? null,
+    });
+  }
+
+  // --- manual data-entry confirmation ----------------------------------------
+  const manualMatch = /^\/api\/jobs\/([a-z0-9-]+)\/manual$/i.exec(route);
+  if (req.method === 'POST' && manualMatch) {
+    const job = getJob(manualMatch[1]!);
+    if (!job) return sendJson(res, 404, { error: 'Unknown job' });
+
+    const body = (await readBody(req)) as { controlId?: string; action?: string };
+    const controlId = typeof body.controlId === 'string' ? body.controlId : '';
+    const action = body.action === 'skip' ? 'skip' : body.action === 'submit' ? 'submit' : null;
+
+    if (!controlId || !action) {
+      return sendJson(res, 400, { error: 'controlId and action ("submit" | "skip") are required.' });
+    }
+
+    const ok = resolveManualStep(job.id, controlId, action);
+    if (!ok) {
+      return sendJson(res, 409, {
+        error: 'That element is not currently waiting on confirmation.',
+      });
+    }
+    return sendJson(res, 200, { ok: true });
+  }
+
+  // --- manual mode: live view (Server-Sent Events) ---------------------------
+  const screencastMatch = /^\/api\/jobs\/([a-z0-9-]+)\/screencast$/i.exec(route);
+  if (req.method === 'GET' && screencastMatch) {
+    const job = getJob(screencastMatch[1]!);
+    if (!job) return sendJson(res, 404, { error: 'Unknown job' });
+
+    const remote = remoteForJob(job);
+    if (!remote) return sendJson(res, 404, { error: 'No live view for this job.' });
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-store',
+      Connection: 'keep-alive',
+    });
+
+    const unsubscribe = remote.onFrame((jpegBase64) => {
+      res.write(`data: ${JSON.stringify({ image: jpegBase64 })}\n\n`);
+    });
+
+    req.on('close', unsubscribe);
+    return;
+  }
+
+  // --- manual mode: forward a click/key/typed text into the live page --------
+  const inputMatch = /^\/api\/jobs\/([a-z0-9-]+)\/input$/i.exec(route);
+  if (req.method === 'POST' && inputMatch) {
+    const job = getJob(inputMatch[1]!);
+    if (!job) return sendJson(res, 404, { error: 'Unknown job' });
+
+    const remote = remoteForJob(job);
+    if (!remote) return sendJson(res, 404, { error: 'No live view for this job.' });
+
+    const body = (await readBody(req)) as {
+      type?: string;
+      x?: number;
+      y?: number;
+      key?: string;
+      value?: string;
+    };
+
+    if (body.type === 'click' && typeof body.x === 'number' && typeof body.y === 'number') {
+      await remote.click(body.x, body.y);
+    } else if (body.type === 'key' && typeof body.key === 'string') {
+      await remote.key(body.key);
+    } else if (body.type === 'text' && typeof body.value === 'string') {
+      await remote.insertText(body.value);
+    } else {
+      return sendJson(res, 400, { error: 'Invalid input event.' });
+    }
+
+    return sendJson(res, 200, { ok: true });
+  }
+
+  // --- document download ----------------------------------------------------
+  const docMatch = /^\/api\/jobs\/([a-z0-9-]+)\/document$/i.exec(route);
+  if (req.method === 'GET' && docMatch) {
+    const job = getJob(docMatch[1]!);
+    if (!job?.documentPath) return sendJson(res, 404, { error: 'No document' });
+
+    const info = await stat(job.documentPath);
+    res.writeHead(200, {
+      'Content-Type':
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'Content-Length': info.size,
+      'Content-Disposition': `attachment; filename="${encodeURIComponent(
+        job.documentName ?? 'document.docx',
+      )}"`,
+    });
+    createReadStream(job.documentPath).pipe(res);
+    return;
+  }
+
+  sendJson(res, 404, { error: 'Not found' });
+}
+
+/** Starts the server and logs the address to open. */
+export function serve(port: number): Promise<http.Server> {
+  return new Promise((resolve) => {
+    const server = createServer();
+    server.listen(port, () => {
+      log.ok(`UI Documentation Engine — open http://localhost:${port}`);
+      resolve(server);
+    });
+  });
+}

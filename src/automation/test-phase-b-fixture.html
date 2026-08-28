@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Phase B Test Fixture</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+    }
+    .item {
+      padding: 10px;
+      margin: 5px;
+      border: 1px solid #ccc;
+      display: inline-block;
+    }
+    .hidden {
+      display: none;
+    }
+    #counter {
+      font-size: 24px;
+      font-weight: bold;
+      margin: 20px 0;
+    }
+    #far-down {
+      margin-top: 200vh;
+      padding: 20px;
+      border: 2px solid green;
+    }
+    dialog {
+      padding: 20px;
+      border: 1px solid black;
+    }
+  </style>
+</head>
+<body>
+  <h1>Phase B Test Fixture</h1>
+
+  <h2>Test 1: count()</h2>
+  <div class="item">Item 1</div>
+  <div class="item">Item 2</div>
+  <div class="item">Item 3</div>
+
+  <h2>Test 2: click()</h2>
+  <div id="counter">0</div>
+  <button id="increment-btn">Increment</button>
+
+  <h2>Test 3: fill()</h2>
+  <input id="text-input" type="text" placeholder="Type here" />
+  <div id="input-changed">No</div>
+
+  <h2>Test 4: isVisible()</h2>
+  <div id="visible" style="border: 1px solid blue">Visible</div>
+  <div id="hidden" style="display: none">Hidden</div>
+
+  <h2>Test 5: scrollIntoViewIfNeeded()</h2>
+  <div id="far-down">Far Below the Fold</div>
+
+  <h2>Test 6: keyboard.press()</h2>
+  <dialog id="test-dialog" open>
+    <p>Press Escape to close this dialog</p>
+  </dialog>
+
+  <script>
+    document.getElementById('increment-btn').addEventListener('click', () => {
+      const counter = document.getElementById('counter');
+      counter.textContent = String(parseInt(counter.textContent || '0') + 1);
+    });
+
+    document.getElementById('text-input').addEventListener('input', () => {
+      document.getElementById('input-changed').textContent = 'Yes';
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        const dialog = document.getElementById('test-dialog');
+        if (dialog) dialog.close();
+      }
+    });
+  </script>
+</body>
+</html>
