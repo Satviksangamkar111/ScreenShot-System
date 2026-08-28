@@ -23,6 +23,26 @@ config/apps/<app>.yaml
 Because assembly reads a trace from disk, document formatting can be corrected
 and the document regenerated without repeating a slow capture run.
 
+### Browser automation layer
+
+The engine talks to Chrome/Edge directly over the Chrome DevTools Protocol.
+`src/automation/` holds that layer:
+
+| Module | Role |
+|---|---|
+| `chrome-launcher.ts` | Finds and launches the installed browser, returns its CDP WebSocket |
+| `cdp-client.ts` / `cdp-session.ts` | Protocol transport and per-target sessions |
+| `page-shim.ts` / `locator-shim.ts` | A small Playwright-shaped API (`page.locator(...).click()`) over raw CDP |
+
+The shims keep the interaction code readable and framework-agnostic. Because
+they resolve selectors themselves rather than delegating to a browser engine,
+`locator-shim.ts` implements the parts of Playwright's selector syntax the
+interaction layer relies on — `:visible`, `:has-text()` and `:text-is()` —
+which plain `querySelectorAll` rejects as a syntax error. `:text-is()` follows
+Playwright in matching the *smallest* element holding the text, and dialog
+actions are then clicked on the element the framework binds its handler to (a
+`button`, or an `li[role="option"]`), never on a text node nested inside it.
+
 ### What becomes a documentation point
 
 A control earns a label + screenshot when it is a **dropdown**, a **calendar**, a
@@ -76,11 +96,27 @@ Page" points is twelve consecutive screenshots — and it is not merely
 stylistic: every image is embedded at a fixed width, so a single tall capture
 of a long form shrinks into an illegible strip.
 
-All segments of a capture appear under that point's single label, matching the
-reference layout. Fiori usually scrolls an inner container rather than the
-window, so the engine locates whatever actually scrolls instead of calling
-`window.scrollTo`, which would otherwise photograph the same screenful
-repeatedly.
+Fiori usually scrolls an inner container rather than the window, so the engine
+locates whatever actually scrolls instead of calling `window.scrollTo`, which
+would otherwise photograph the same screenful repeatedly.
+
+**Capture happens per section, not once at the end.** As each section finishes
+(Form Section, then Copy Section, and so on) the page is photographed
+top-to-bottom immediately, while that section's own values are still on
+screen. Those batches are then cumulated into the page's single `Full Page`
+point, in the order the sections were processed, so the document shows every
+section's filled state under one heading.
+
+Photographing once after *all* sections completed — the earlier behaviour —
+left a long window in which the form could change underneath the camera. A
+production run showed the cost precisely: the `Full Page` image for a branch
+was byte-for-byte identical to that branch's opening screenshot, because a
+chooser dialog had been reopened by a later section's own value-help and was
+still covering the form when the single closing shot was taken. The filled
+form was never photographed at all.
+
+Both Manual and Automatic data-entry modes run through the same section
+processing, so this applies to both without a mode-specific path.
 
 ### UI5 id churn
 
@@ -93,11 +129,12 @@ list of "element not present" skips for fields that were plainly on screen.
 
 Each control therefore carries a second, view-independent selector built from
 the application-authored part of its id (`[id$="--DueDateId-inner"]`). That
-form is **preferred** whenever it identifies exactly one element: Playwright
-resolves a locator at action time, so a selector free of the volatile view
-number stays correct even if the view renumbers between resolution and the
-click or fill that follows — a race that otherwise fails a field which was on
-screen throughout. The exact id is used when the suffix matches several
+form is **preferred** whenever it identifies exactly one element: a locator is
+resolved at action time, not when it is built, so a selector free of the
+volatile view number stays correct even if the view renumbers between
+resolution and the click or fill that follows — a race that otherwise fails a
+field which was on screen throughout. The exact id is used when the suffix
+matches several
 elements (two view instances briefly mounted together). Ids with no `--`
 prefix (`SalesAreaDialog-cancel`) are application-authored already and need no
 fallback.
@@ -214,11 +251,29 @@ clicked**. Because such buttons yield no documentation point, refusing to click
 them costs the document nothing. `safety.allowLabels` (Search, Execute, Go) are
 read-only queries and are permitted.
 
+## Requirements
+
+| Requirement | Why |
+|---|---|
+| **Node.js ≥ 20** | Runs the engine and the web server |
+| **Google Chrome _or_ Microsoft Edge** | Driven directly over the Chrome DevTools Protocol |
+
+There is **no browser download step**. The engine does not bundle or fetch a
+browser: it launches whichever Chrome or Edge is already installed on the
+machine, in that order of preference, searching the standard install paths and
+falling back to the Windows registry (`src/automation/chrome-launcher.ts`).
+Edge is Chromium-based and speaks the same protocol, so a stock Windows machine
+with no Chrome installed works unchanged. If neither is found, startup fails
+immediately with `Chrome or Edge not found`.
+
+Nothing else is needed — no ChromeDriver, no Playwright/Puppeteer browser
+binaries, no Docker. CDP is served by the browser itself over a WebSocket that
+the launcher opens with `--remote-debugging-port=0`.
+
 ## Setup
 
 ```bash
 npm install
-npx playwright install chromium
 ```
 
 ## Web interface
@@ -236,6 +291,13 @@ view in the page and waits. Once every sign-in is complete the capture runs auto
 Sessions are saved **per origin** under `auth/.storage/`, so a host is signed in
 to once and reused afterwards — and two versions on the same host only require
 one sign-in.
+
+The live view is embedded in the page, and the same view can be opened in its
+own tab at `/live/jobs/<jobId>` — the Progress log prints the link when a
+sign-in begins. A full tab is the better surface for SSO flows that involve a
+password manager, a certificate prompt or MFA. Either view forwards clicks and
+typing to the real browser and closes itself once the session is saved. An
+expired session mid-capture reopens the same flow and retries the capture.
 
 URLs can also be prefilled for sharing:
 `http://localhost:5173/?old=<encoded>&new=<encoded>`
